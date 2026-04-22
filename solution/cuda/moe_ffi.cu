@@ -1,5 +1,6 @@
 #include <tvm/ffi/tvm_ffi.h>
 #include <tvm/ffi/container/tensor.h>
+#include <algorithm>
 
 // Include the existing CUDA kernel implementations
 #include "moe_routing.cu"
@@ -17,6 +18,53 @@
 
 
 namespace ffi = tvm::ffi;
+
+namespace {
+
+struct PersistentBuffer {
+    void* ptr{nullptr};
+    size_t bytes{0};
+
+    ~PersistentBuffer() {
+        if (ptr) {
+            cudaFree(ptr);
+        }
+    }
+
+    void ensure(size_t required_bytes) {
+        if (required_bytes == 0 || required_bytes <= bytes) {
+            return;
+        }
+        if (ptr) {
+            cudaFree(ptr);
+        }
+        cudaMalloc(&ptr, required_bytes);
+        bytes = required_bytes;
+    }
+};
+
+PersistentBuffer& scan_workspace() {
+    static PersistentBuffer buffer;
+    return buffer;
+}
+
+PersistentBuffer& k4_workspace_cache() {
+    static PersistentBuffer buffer;
+    return buffer;
+}
+
+PersistentBuffer& k6_workspace_cache() {
+    static PersistentBuffer buffer;
+    return buffer;
+}
+
+__global__ void finalize_scan_offsets_kernel(const int* counts, const int* offsets, int* output, int num_counts) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        output[num_counts] = offsets[num_counts - 1] + counts[num_counts - 1];
+    }
+}
+
+}  // namespace
 
 // ─── Router FFI ───────────────────────────────────────────────────────────────
 
@@ -54,15 +102,20 @@ void scan_ffi_wrapper(ffi::Tensor counts, ffi::Tensor offsets, int num_items) {
     // num_items is E_LOCAL + 1 (e.g., 33)
     // counts has E_LOCAL items (e.g., 32)
     int E = num_items - 1;
-    exclusive_scan_cub(static_cast<int*>(counts.data_ptr()), 
-                       static_cast<int*>(offsets.data_ptr()), E);
-    
-    // Compute the last element: offsets[E] = offsets[E-1] + counts[E-1]
-    int last_c, last_o;
-    cudaMemcpy(&last_c, static_cast<int*>(counts.data_ptr()) + E - 1, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&last_o, static_cast<int*>(offsets.data_ptr()) + E - 1, sizeof(int), cudaMemcpyDeviceToHost);
-    int total = last_c + last_o;
-    cudaMemcpy(static_cast<int*>(offsets.data_ptr()) + E, &total, sizeof(int), cudaMemcpyHostToDevice);
+    auto& workspace = scan_workspace();
+    const size_t temp_storage_bytes = get_scan_temp_storage_bytes(E);
+    workspace.ensure(temp_storage_bytes);
+    exclusive_scan_cub_persistent(
+        workspace.ptr,
+        temp_storage_bytes,
+        static_cast<int*>(counts.data_ptr()),
+        static_cast<int*>(offsets.data_ptr()),
+        E);
+    finalize_scan_offsets_kernel<<<1, 1>>>(
+        static_cast<const int*>(counts.data_ptr()),
+        static_cast<const int*>(offsets.data_ptr()),
+        static_cast<int*>(offsets.data_ptr()),
+        E);
 }
 
 static auto _scan = ffi::reflection::GlobalDef().def("scan_ffi", scan_ffi_wrapper);
@@ -107,12 +160,10 @@ void kernel4_ffi_wrapper(ffi::Tensor hidden_states,
     cudaMemcpy(&total_tok, static_cast<int*>(expert_token_offsets.data_ptr()) + moe_spec::NUM_LOCAL_EXPERTS, sizeof(int), cudaMemcpyDeviceToHost);
 
     size_t workspace_bytes = k4_query_workspace(seq_len, total_tok, 0);
-    void* d_workspace = nullptr;
-    if (workspace_bytes > 0) {
-        cudaMalloc(&d_workspace, workspace_bytes);
-    }
+    auto& workspace_cache = k4_workspace_cache();
+    workspace_cache.ensure(workspace_bytes);
 
-    Kernel4Workspace workspace = k4_bind_workspace(d_workspace, workspace_bytes, seq_len, total_tok, 0);
+    Kernel4Workspace workspace = k4_bind_workspace(workspace_cache.ptr, workspace_bytes, seq_len, total_tok, 0);
 
     Kernel4Problem problem{};
     problem.routing_logits = nullptr;
@@ -134,8 +185,6 @@ void kernel4_ffi_wrapper(ffi::Tensor hidden_states,
     problem.stream = nullptr;
 
     k4_launch(problem, workspace);
-
-    if (d_workspace) cudaFree(d_workspace);
 }
 
 static auto _kernel4 = ffi::reflection::GlobalDef().def("kernel4_ffi", kernel4_ffi_wrapper);
@@ -155,12 +204,10 @@ void gemm1_swiglu_ffi_wrapper(ffi::Tensor hidden_states,
     cudaMemcpy(&total_tok, static_cast<int*>(expert_token_offsets.data_ptr()) + moe_spec::NUM_LOCAL_EXPERTS, sizeof(int), cudaMemcpyDeviceToHost);
 
     size_t workspace_bytes = k4_query_workspace(seq_len, total_tok, 0);
-    void* d_workspace = nullptr;
-    if (workspace_bytes > 0) {
-        cudaMalloc(&d_workspace, workspace_bytes);
-    }
+    auto& workspace_cache = k4_workspace_cache();
+    workspace_cache.ensure(workspace_bytes);
 
-    Kernel4Workspace workspace = k4_bind_workspace(d_workspace, workspace_bytes, seq_len, total_tok, 0);
+    Kernel4Workspace workspace = k4_bind_workspace(workspace_cache.ptr, workspace_bytes, seq_len, total_tok, 0);
 
     Kernel4Problem problem{};
     problem.seq_len = seq_len;
@@ -181,8 +228,6 @@ void gemm1_swiglu_ffi_wrapper(ffi::Tensor hidden_states,
     cudaMemcpy(output.data_ptr(), workspace.gemm1_output, 
                (size_t)total_tok * moe_spec::INTERMEDIATE_SIZE * sizeof(__nv_bfloat16), 
                cudaMemcpyDeviceToDevice);
-
-    if (d_workspace) cudaFree(d_workspace);
 }
 
 static auto _gemm1_swiglu = ffi::reflection::GlobalDef().def("gemm1_swiglu_ffi", gemm1_swiglu_ffi_wrapper);
@@ -202,12 +247,10 @@ void kernel6_ffi_wrapper(ffi::Tensor hidden_states,
     cudaMemcpy(&total_tok, static_cast<int*>(expert_token_offsets.data_ptr()) + moe_spec::NUM_LOCAL_EXPERTS, sizeof(int), cudaMemcpyDeviceToHost);
 
     size_t workspace_bytes = k6_query_workspace(seq_len, total_tok, 0);
-    void* d_workspace = nullptr;
-    if (workspace_bytes > 0) {
-        cudaMalloc(&d_workspace, workspace_bytes);
-    }
+    auto& workspace_cache = k6_workspace_cache();
+    workspace_cache.ensure(workspace_bytes);
 
-    Kernel6Workspace workspace = k6_bind_workspace(d_workspace, workspace_bytes, seq_len, total_tok, 0);
+    Kernel6Workspace workspace = k6_bind_workspace(workspace_cache.ptr, workspace_bytes, seq_len, total_tok, 0);
 
     Kernel6Problem problem{};
     problem.hidden_states = static_cast<const __nv_bfloat16*>(hidden_states.data_ptr());
@@ -224,8 +267,6 @@ void kernel6_ffi_wrapper(ffi::Tensor hidden_states,
     problem.stream = nullptr;
 
     k6_launch(problem, workspace);
-
-    if (d_workspace) cudaFree(d_workspace);
 }
 
 static auto _kernel6 = ffi::reflection::GlobalDef().def("kernel6_ffi", kernel6_ffi_wrapper);

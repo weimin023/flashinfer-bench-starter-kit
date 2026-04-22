@@ -27,22 +27,20 @@ def get_token_indices(
     """
     device = token_expert_indices.device
     total_assigned = expert_token_offsets[E_LOCAL].item()
-    
-    token_indices = torch.zeros(total_assigned, dtype=torch.int32, device=device)
-    
-    indices_cpu = token_expert_indices.cpu()
-    slots_cpu = token_expert_slots.cpu()
-    offsets_cpu = expert_token_offsets.cpu()
-    
-    for t in range(seq_len):
-        for k in range(TOP_K):
-            ge = indices_cpu[t, k].item()
-            if local_expert_offset <= ge < local_expert_offset + E_LOCAL:
-                le = ge - local_expert_offset
-                slot = slots_cpu[t, k].item()
-                dest = offsets_cpu[le].item() + slot
-                token_indices[dest] = t
-                
+    if total_assigned == 0:
+        return torch.empty(0, dtype=torch.int32, device=device)
+
+    local_mask = (
+        (token_expert_indices >= local_expert_offset) &
+        (token_expert_indices < local_expert_offset + E_LOCAL)
+    )
+    local_experts = (token_expert_indices[local_mask] - local_expert_offset).to(torch.int64)
+    slots = token_expert_slots[local_mask].to(torch.int64)
+    dest = expert_token_offsets[local_experts].to(torch.int64) + slots
+
+    token_ids = torch.arange(seq_len, device=device, dtype=torch.int32).unsqueeze(1).expand(-1, TOP_K)
+    token_indices = torch.empty(total_assigned, dtype=torch.int32, device=device)
+    token_indices[dest] = token_ids[local_mask]
     return token_indices
 
 def gather_merged_weights(
@@ -73,23 +71,19 @@ def gather_merged_weights(
     """
     device = token_expert_indices.device
     total_assigned = expert_token_offsets[E_LOCAL].item()
-    
-    merged_weights = torch.zeros(total_assigned, dtype=torch.float32, device=device)
-    
-    indices_cpu = token_expert_indices.cpu()
-    weights_cpu = token_expert_weights.cpu()
-    slots_cpu = token_expert_slots.cpu()
-    offsets_cpu = expert_token_offsets.cpu()
-    
-    for t in range(seq_len):
-        for k in range(TOP_K):
-            ge = indices_cpu[t, k].item()
-            if local_expert_offset <= ge < local_expert_offset + E_LOCAL:
-                le = ge - local_expert_offset
-                slot = slots_cpu[t, k].item()
-                dest = offsets_cpu[le].item() + slot
-                merged_weights[dest] = weights_cpu[t, k].item()
-                
+    if total_assigned == 0:
+        return torch.empty(0, dtype=torch.float32, device=device)
+
+    local_mask = (
+        (token_expert_indices >= local_expert_offset) &
+        (token_expert_indices < local_expert_offset + E_LOCAL)
+    )
+    local_experts = (token_expert_indices[local_mask] - local_expert_offset).to(torch.int64)
+    slots = token_expert_slots[local_mask].to(torch.int64)
+    dest = expert_token_offsets[local_experts].to(torch.int64) + slots
+
+    merged_weights = torch.empty(total_assigned, dtype=torch.float32, device=device)
+    merged_weights[dest] = token_expert_weights[local_mask]
     return merged_weights
 
 def integrated_moe(
@@ -178,11 +172,10 @@ def integrated_moe(
     torch.cuda.nvtx.range_pop()
 
     # --- Step 4: KERNEL 4 (GEMM1 + SwiGLU) ---
-    torch.cuda.nvtx.range_push("moe_gemm1_swiglu")
     # I = intermediate_size. gemm2_weights shape is [E_LOCAL, H, I]
     I = gemm2_weights.shape[2] 
     inter_tokens = torch.zeros(total_assigned, I, device=device, dtype=torch.bfloat16)
-    
+    torch.cuda.nvtx.range_push("moe_gemm1_swiglu")
     gemm1_func = tvm_ffi.get_global_func("gemm1_swiglu_ffi")
     gemm1_func(
         tvm_ffi.from_dlpack(hidden_states),
@@ -197,8 +190,8 @@ def integrated_moe(
     torch.cuda.nvtx.range_pop()
     
     # --- Step 5: KERNEL 6 (GEMM2) ---
-    torch.cuda.nvtx.range_push("moe_gemm2_acc")
     output = torch.zeros(seq_len, H, device=device, dtype=torch.bfloat16)
+    torch.cuda.nvtx.range_push("moe_gemm2_acc")
     gemm2_func = tvm_ffi.get_global_func("kernel6_ffi")
     gemm2_func(
         tvm_ffi.from_dlpack(inter_tokens),
