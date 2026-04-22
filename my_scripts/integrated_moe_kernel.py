@@ -92,6 +92,32 @@ def gather_merged_weights(
                 
     return merged_weights
 
+def reindex_and_gather_gpu(
+    token_expert_indices: torch.Tensor,
+    token_expert_weights: torch.Tensor,
+    token_expert_slots: torch.Tensor,
+    expert_token_offsets: torch.Tensor,
+    seq_len: int,
+    TOP_K: int,
+    local_expert_offset: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build expert-grouped token ids and routing weights without host copies."""
+    capacity = seq_len * TOP_K
+    token_indices = torch.empty(capacity, dtype=torch.int32, device=token_expert_indices.device)
+    merged_token_weights = torch.empty(capacity, dtype=torch.float32, device=token_expert_indices.device)
+
+    reindex_func = tvm_ffi.get_global_func("reindex_ffi")
+    reindex_func(
+        tvm_ffi.from_dlpack(token_expert_indices),
+        tvm_ffi.from_dlpack(token_expert_weights),
+        tvm_ffi.from_dlpack(token_expert_slots),
+        tvm_ffi.from_dlpack(expert_token_offsets),
+        tvm_ffi.from_dlpack(token_indices),
+        tvm_ffi.from_dlpack(merged_token_weights),
+        seq_len, local_expert_offset
+    )
+    return token_indices, merged_token_weights
+
 def integrated_moe(
     routing_logits: torch.Tensor,
     routing_bias: torch.Tensor,
@@ -166,22 +192,20 @@ def integrated_moe(
         E_LOCAL + 1
     )
     torch.cuda.nvtx.range_pop()
-    
-    total_assigned = expert_token_offsets[E_LOCAL].item()
-    if total_assigned == 0:
-        return torch.zeros(seq_len, H, device=device, dtype=torch.bfloat16)
 
     # --- Step 3: PREPARE INDICES ---
     torch.cuda.nvtx.range_push("moe_reindex")
-    token_indices = get_token_indices(token_expert_indices, token_expert_slots, expert_token_offsets, seq_len, TOP_K, E_LOCAL, local_expert_offset)
-    merged_token_weights = gather_merged_weights(token_expert_indices, token_expert_weights, token_expert_slots, expert_token_offsets, seq_len, TOP_K, E_LOCAL, local_expert_offset)
+    token_indices, merged_token_weights = reindex_and_gather_gpu(
+        token_expert_indices, token_expert_weights, token_expert_slots,
+        expert_token_offsets, seq_len, TOP_K, local_expert_offset
+    )
     torch.cuda.nvtx.range_pop()
 
     # --- Step 4: KERNEL 4 (GEMM1 + SwiGLU) ---
     torch.cuda.nvtx.range_push("moe_gemm1_swiglu")
     # I = intermediate_size. gemm2_weights shape is [E_LOCAL, H, I]
     I = gemm2_weights.shape[2] 
-    inter_tokens = torch.zeros(total_assigned, I, device=device, dtype=torch.bfloat16)
+    inter_tokens = torch.empty(seq_len * TOP_K, I, device=device, dtype=torch.bfloat16)
     
     gemm1_func = tvm_ffi.get_global_func("gemm1_swiglu_ffi")
     gemm1_func(

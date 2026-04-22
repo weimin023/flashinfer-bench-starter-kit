@@ -5,6 +5,7 @@
 #include "moe_routing.cu"
 #include "moe_scan.cu"
 #include "moe_dispatch.cu"
+#include "moe_reindex.cu"
 #include "moe_expert_mlp/kernel4_cuda_kernels.cu"
 #include "moe_expert_mlp/kernel4_backends.cu"
 #include "moe_expert_mlp/kernel4.cu"
@@ -88,6 +89,30 @@ void dispatch_ffi_wrapper(ffi::Tensor hidden_states_fp8,     // [T, H]  FP8 E4M3
 }
 
 static auto _dispatch = ffi::reflection::GlobalDef().def("dispatch_ffi", dispatch_ffi_wrapper);
+
+// ─── Reindex / Merge Weights FFI ────────────────────────────────────────────
+
+void reindex_ffi_wrapper(ffi::Tensor token_expert_indices,   // [T, TOP_K]
+                         ffi::Tensor token_expert_weights,   // [T, TOP_K]
+                         ffi::Tensor token_expert_slots,     // [T, TOP_K]
+                         ffi::Tensor expert_token_offsets,   // [E_LOCAL + 1]
+                         ffi::Tensor token_indices,          // [T * TOP_K] capacity
+                         ffi::Tensor merged_token_weights,   // [T * TOP_K] capacity
+                         int seq_len,
+                         int local_expert_offset) {
+    launch_moe_reindex(
+        static_cast<const int*>(token_expert_indices.data_ptr()),
+        static_cast<const float*>(token_expert_weights.data_ptr()),
+        static_cast<const int*>(token_expert_slots.data_ptr()),
+        static_cast<const int*>(expert_token_offsets.data_ptr()),
+        static_cast<int*>(token_indices.data_ptr()),
+        static_cast<float*>(merged_token_weights.data_ptr()),
+        seq_len,
+        local_expert_offset
+    );
+}
+
+static auto _reindex = ffi::reflection::GlobalDef().def("reindex_ffi", reindex_ffi_wrapper);
 
 // ─── Kernel4 FFI ─────────────────────────────────────────────────────────────
 
