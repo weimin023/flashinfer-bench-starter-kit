@@ -11,7 +11,8 @@
 enum class Kernel6Backend : int {
     Auto = 0,
     Fallback = 1,
-    Cutlass = 2,
+    Tiled = 2,
+    Cutlass = 3,
 };
 
 struct Kernel6Problem {
@@ -24,6 +25,7 @@ struct Kernel6Problem {
     int                   local_expert_offset;
     float                 routed_scaling_factor;
     const int*            expert_token_offsets;   // [NUM_LOCAL_EXPERTS + 1], device ptr
+    int                   total_dispatched_tokens = -1; // optional precomputed total, <0 means query from device
     const int*            token_indices;          // [total_dispatched_tokens], device ptr
     const int*            local_expert_ids;       // [total_dispatched_tokens], device ptr
     const float*          token_expert_weights;   // [total_dispatched_tokens], device ptr

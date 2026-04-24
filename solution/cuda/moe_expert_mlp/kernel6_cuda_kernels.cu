@@ -2,6 +2,168 @@
 
 namespace kernel6_internal {
 
+__global__ void fp8_gemm2_tiled_project_and_combine_kernel(
+    const __nv_bfloat16* __restrict__ inter,
+    const int*           __restrict__ token_indices,
+    const float*         __restrict__ routing_w,
+    const fp8_e4m3*      __restrict__ W2,
+    const float*         __restrict__ W2_scale,
+    float                routed_scaling_factor,
+    float*               __restrict__ output_accum,
+    int                  token_offset,
+    int                  token_count,
+    int                  seq_len)
+{
+    int tile_tok = blockIdx.x * K6_TILE_T;
+    int tile_h = blockIdx.y;
+    int local_h = threadIdx.x;
+    int out_col = tile_h * K6_TILE_H + local_h;
+
+    __shared__ float inter_smem[K6_TILE_T][BLOCK_SIZE];
+    __shared__ uint8_t w_smem[K6_TILE_H][BLOCK_SIZE];
+
+    float acc[K6_TILE_T] = {};
+
+    for (int ib = 0; ib < NUM_INTER_BLOCKS; ++ib) {
+        int k_base = ib * BLOCK_SIZE;
+
+        for (int t = 0; t < K6_TILE_T; ++t) {
+            int tok = tile_tok + t;
+            if (tok < token_count && local_h < BLOCK_SIZE) {
+                inter_smem[t][local_h] = __bfloat162float(
+                    inter[(size_t)(token_offset + tok) * INTERMEDIATE_SIZE + k_base + local_h]);
+            } else if (local_h < BLOCK_SIZE) {
+                inter_smem[t][local_h] = 0.f;
+            }
+        }
+
+        if (out_col < HIDDEN_SIZE) {
+            for (int k = 0; k < BLOCK_SIZE; ++k) {
+                w_smem[threadIdx.x][k] = load_cached(
+                    W2 + (size_t)out_col * INTERMEDIATE_SIZE + k_base + k);
+            }
+        }
+
+        __syncthreads();
+
+        if (out_col < HIDDEN_SIZE) {
+            float tile_scale = load_cached(
+                W2_scale + (out_col / BLOCK_SIZE) * NUM_INTER_BLOCKS + ib);
+            for (int t = 0; t < K6_TILE_T; ++t) {
+                int tok = tile_tok + t;
+                if (tok >= token_count) {
+                    break;
+                }
+                float dot = 0.f;
+                for (int k = 0; k < BLOCK_SIZE; ++k) {
+                    dot += inter_smem[t][k] * fp8_to_float(w_smem[threadIdx.x][k]);
+                }
+                acc[t] += dot * tile_scale;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (out_col >= HIDDEN_SIZE) {
+        return;
+    }
+
+    for (int t = 0; t < K6_TILE_T; ++t) {
+        int tok = tile_tok + t;
+        if (tok >= token_count) {
+            break;
+        }
+        int orig_tok = load_cached(token_indices + token_offset + tok);
+        if (orig_tok < 0 || orig_tok >= seq_len) {
+            continue;
+        }
+        float rw = load_cached(routing_w + token_offset + tok) * routed_scaling_factor;
+        atomicAdd(output_accum + (size_t)orig_tok * HIDDEN_SIZE + out_col, acc[t] * rw);
+    }
+}
+
+__global__ void fp8_gemm2_micro_project_and_combine_kernel(
+    const __nv_bfloat16* __restrict__ inter,
+    const int*           __restrict__ token_indices,
+    const float*         __restrict__ routing_w,
+    const fp8_e4m3*      __restrict__ W2,
+    const float*         __restrict__ W2_scale,
+    float                routed_scaling_factor,
+    float*               __restrict__ output_accum,
+    int                  token_offset,
+    int                  token_count,
+    int                  seq_len)
+{
+    int tile_tok = blockIdx.x * K6_MICRO_TILE_T;
+    int tile_h = blockIdx.y;
+    int lane = threadIdx.x;
+    int out_col = tile_h * K6_MICRO_TILE_H + lane;
+
+    __shared__ float inter_smem[K6_MICRO_TILE_T][BLOCK_SIZE];
+    __shared__ uint8_t w_smem[K6_MICRO_TILE_H][BLOCK_SIZE];
+
+    float acc[K6_MICRO_TILE_T] = {};
+
+    for (int ib = 0; ib < NUM_INTER_BLOCKS; ++ib) {
+        int k_base = ib * BLOCK_SIZE;
+
+        for (int t = 0; t < K6_MICRO_TILE_T; ++t) {
+            int tok = tile_tok + t;
+            for (int k = lane; k < BLOCK_SIZE; k += K6_MICRO_TILE_H) {
+                inter_smem[t][k] = (tok < token_count)
+                    ? __bfloat162float(inter[(size_t)(token_offset + tok) * INTERMEDIATE_SIZE + k_base + k])
+                    : 0.f;
+            }
+        }
+
+        if (out_col < HIDDEN_SIZE) {
+            for (int k = 0; k < BLOCK_SIZE; ++k) {
+                w_smem[lane][k] = load_cached(
+                    W2 + (size_t)out_col * INTERMEDIATE_SIZE + k_base + k);
+            }
+        }
+
+        __syncthreads();
+
+        if (out_col < HIDDEN_SIZE) {
+            float tile_scale = load_cached(
+                W2_scale + (out_col / BLOCK_SIZE) * NUM_INTER_BLOCKS + ib);
+            for (int t = 0; t < K6_MICRO_TILE_T; ++t) {
+                int tok = tile_tok + t;
+                if (tok >= token_count) {
+                    break;
+                }
+                float dot = 0.f;
+                #pragma unroll
+                for (int k = 0; k < BLOCK_SIZE; ++k) {
+                    dot += inter_smem[t][k] * fp8_to_float(w_smem[lane][k]);
+                }
+                acc[t] += dot * tile_scale;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (out_col >= HIDDEN_SIZE) {
+        return;
+    }
+
+    for (int t = 0; t < K6_MICRO_TILE_T; ++t) {
+        int tok = tile_tok + t;
+        if (tok >= token_count) {
+            break;
+        }
+        int orig_tok = load_cached(token_indices + token_offset + tok);
+        if (orig_tok < 0 || orig_tok >= seq_len) {
+            continue;
+        }
+        float rw = load_cached(routing_w + token_offset + tok) * routed_scaling_factor;
+        atomicAdd(output_accum + (size_t)orig_tok * HIDDEN_SIZE + out_col, acc[t] * rw);
+    }
+}
+
 __global__ void fp8_gemm2_project_and_combine_kernel(
     const __nv_bfloat16* __restrict__ inter,
     const int*           __restrict__ local_expert_ids,

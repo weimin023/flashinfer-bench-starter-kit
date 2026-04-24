@@ -46,6 +46,8 @@ struct Kernel4Problem {
     int                   local_expert_offset;    // this rank owns experts [offset, offset+32)
     float                 routed_scaling_factor;  // multiply final weighted sum
     const int*            expert_token_offsets;   // [NUM_LOCAL_EXPERTS + 1], device ptr
+    const int*            host_expert_token_offsets = nullptr; // [NUM_LOCAL_EXPERTS + 1], optional host mirror
+    int                   total_dispatched_tokens = -1;   // optional precomputed total, <0 means query from device
     const int*            token_indices;          // [total_dispatched_tokens], device ptr
     const int*            local_expert_ids;       // [total_dispatched_tokens], device ptr
     const float*          token_expert_weights;   // [total_dispatched_tokens], device ptr

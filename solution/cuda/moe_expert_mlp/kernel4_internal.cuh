@@ -20,6 +20,10 @@ namespace kernel4_internal {
 constexpr int BT = 4;
 constexpr int BN = 128;
 constexpr int BK = 128;
+constexpr int K4_MICRO_BT = 2;
+constexpr int K4_MICRO_BN = 64;
+constexpr int K4_SMALL_BT = 4;
+constexpr int K4_SMALL_BN = 64;
 constexpr size_t kWorkspaceAlign = kernel6_internal::kWorkspaceAlign;
 
 using kernel6_internal::load_cached;
@@ -68,6 +72,26 @@ __global__ void fp8_gemm1_swiglu_reference_kernel(
     const float*    __restrict__ W_scale,
     __nv_bfloat16*  __restrict__ out,
     int             total_tokens,
+    int             seq_len);
+
+__global__ void fp8_gemm1_swiglu_micro_kernel(
+    const fp8_e4m3* __restrict__ act,
+    const float*    __restrict__ act_scale,
+    const int*      __restrict__ token_indices,
+    int             T_e,
+    const fp8_e4m3* __restrict__ W,
+    const float*    __restrict__ W_scale,
+    __nv_bfloat16*  __restrict__ out,
+    int             seq_len);
+
+__global__ void fp8_gemm1_swiglu_small_kernel(
+    const fp8_e4m3* __restrict__ act,
+    const float*    __restrict__ act_scale,
+    const int*      __restrict__ token_indices,
+    int             T_e,
+    const fp8_e4m3* __restrict__ W,
+    const float*    __restrict__ W_scale,
+    __nv_bfloat16*  __restrict__ out,
     int             seq_len);
 
 #if defined(K4_ENABLE_CUTLASS)

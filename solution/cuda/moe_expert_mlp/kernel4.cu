@@ -86,8 +86,8 @@ cudaError_t k4_launch_impl(const Kernel4Problem& p,
         return cudaErrorInvalidValue;
     }
 
-    int total_tokens = 0;
-    {
+    int total_tokens = p.total_dispatched_tokens;
+    if (total_tokens < 0) {
         int last = 0;
         CUDA_CHECK(cudaMemcpy(&last,
             p.expert_token_offsets + NUM_LOCAL_EXPERTS,

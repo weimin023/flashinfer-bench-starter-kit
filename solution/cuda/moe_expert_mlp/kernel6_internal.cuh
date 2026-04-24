@@ -17,6 +17,10 @@ namespace kernel6_internal {
 using namespace moe_spec;
 
 constexpr size_t kWorkspaceAlign = 256;
+constexpr int K6_TILE_T = 4;
+constexpr int K6_TILE_H = 64;
+constexpr int K6_MICRO_TILE_T = 2;
+constexpr int K6_MICRO_TILE_H = 32;
 
 inline size_t align_up(size_t value, size_t alignment = kWorkspaceAlign) {
     return (value + alignment - 1) / alignment * alignment;
@@ -90,6 +94,30 @@ __global__ void fp8_gemm2_project_and_combine_kernel(
     float*               __restrict__ output_accum,
     int                  total_tokens);
 
+__global__ void fp8_gemm2_tiled_project_and_combine_kernel(
+    const __nv_bfloat16* __restrict__ inter,
+    const int*           __restrict__ token_indices,
+    const float*         __restrict__ routing_w,
+    const fp8_e4m3*      __restrict__ W2,
+    const float*         __restrict__ W2_scale,
+    float                routed_scaling_factor,
+    float*               __restrict__ output_accum,
+    int                  token_offset,
+    int                  token_count,
+    int                  seq_len);
+
+__global__ void fp8_gemm2_micro_project_and_combine_kernel(
+    const __nv_bfloat16* __restrict__ inter,
+    const int*           __restrict__ token_indices,
+    const float*         __restrict__ routing_w,
+    const fp8_e4m3*      __restrict__ W2,
+    const float*         __restrict__ W2_scale,
+    float                routed_scaling_factor,
+    float*               __restrict__ output_accum,
+    int                  token_offset,
+    int                  token_count,
+    int                  seq_len);
+
 __global__ void combine_projected_kernel(
     const float*   __restrict__ projected,
     const int*     __restrict__ token_indices,
@@ -127,5 +155,9 @@ cudaError_t launch_cutlass_gemm2_combine(const Gemm2Problem& p,
 cudaError_t launch_fallback_gemm2_combine(const Gemm2Problem& p,
                                           const Gemm2Workspace& workspace,
                                           int total_tokens);
+
+cudaError_t launch_tiled_gemm2_combine(const Gemm2Problem& p,
+                                       const Gemm2Workspace& workspace,
+                                       int total_tokens);
 
 }  // namespace kernel6_internal

@@ -7,16 +7,18 @@ _SCAN_FUNC = None
 _REINDEX_FUNC = None
 _GEMM1_FUNC = None
 _GEMM2_FUNC = None
+_INTEGRATED_MOE_FUNC = None
 
 
 def _get_global_func_cached(name: str):
-    global _ROUTER_FUNC, _SCAN_FUNC, _REINDEX_FUNC, _GEMM1_FUNC, _GEMM2_FUNC
+    global _ROUTER_FUNC, _SCAN_FUNC, _REINDEX_FUNC, _GEMM1_FUNC, _GEMM2_FUNC, _INTEGRATED_MOE_FUNC
     cache = {
         "router_ffi": "_ROUTER_FUNC",
         "scan_ffi": "_SCAN_FUNC",
         "reindex_ffi": "_REINDEX_FUNC",
         "gemm1_swiglu_ffi": "_GEMM1_FUNC",
         "kernel6_ffi": "_GEMM2_FUNC",
+        "integrated_moe_ffi": "_INTEGRATED_MOE_FUNC",
     }
     cache_name = cache[name]
     func = globals()[cache_name]
@@ -186,83 +188,36 @@ def integrated_moe(
     device = routing_logits.device
     seq_len = routing_logits.shape[0]
     H = hidden_states.shape[1]
-    
-    # --- Step 1: ROUTING ---
-    torch.cuda.nvtx.range_push("moe_routing")
-    expert_token_counts = torch.zeros(E_GLOBAL, device=device, dtype=torch.int32)
-    token_expert_indices = torch.zeros(seq_len, TOP_K, device=device, dtype=torch.int32)
-    token_expert_weights = torch.zeros(seq_len, TOP_K, device=device, dtype=torch.float32)
-    token_expert_slots = torch.zeros(seq_len, TOP_K, device=device, dtype=torch.int32)
-    
-    router_func = _get_global_func_cached("router_ffi")
-    router_func(
-        tvm_ffi.from_dlpack(routing_logits.to(torch.float32)),
-        tvm_ffi.from_dlpack(routing_bias.to(torch.bfloat16)),
-        tvm_ffi.from_dlpack(expert_token_counts),
-        tvm_ffi.from_dlpack(token_expert_indices),
-        tvm_ffi.from_dlpack(token_expert_weights),
-        tvm_ffi.from_dlpack(token_expert_slots),
-        seq_len, local_expert_offset, routed_scaling_factor
-    )
-    torch.cuda.nvtx.range_pop()
-    
-    # --- Step 2: SCAN ---
-    torch.cuda.nvtx.range_push("moe_scan")
-    expert_token_offsets = torch.zeros(E_LOCAL + 1, device=device, dtype=torch.int32)
-    local_counts = expert_token_counts[local_expert_offset : local_expert_offset + E_LOCAL]
-    
-    scan_func = _get_global_func_cached("scan_ffi")
-    scan_func(
-        tvm_ffi.from_dlpack(local_counts),
-        tvm_ffi.from_dlpack(expert_token_offsets),
-        E_LOCAL + 1
-    )
-    torch.cuda.nvtx.range_pop()
-
-    # --- Step 3: PREPARE INDICES ---
-    torch.cuda.nvtx.range_push("moe_reindex")
-    token_indices, local_expert_ids, merged_token_weights = reindex_and_gather_gpu(
-        token_expert_indices, token_expert_weights, token_expert_slots,
-        expert_token_offsets, seq_len, TOP_K, local_expert_offset
-    )
-    torch.cuda.nvtx.range_pop()
-
-    # --- Step 4: KERNEL 4 (GEMM1 + SwiGLU) ---
-    torch.cuda.nvtx.range_push("moe_gemm1_swiglu")
-    # I = intermediate_size. gemm2_weights shape is [E_LOCAL, H, I]
-    I = gemm2_weights.shape[2]
-    total_assigned = int(expert_token_offsets[-1].item())
-    inter_tokens = torch.empty(total_assigned, I, device=device, dtype=torch.bfloat16)
-    
-    gemm1_func = _get_global_func_cached("gemm1_swiglu_ffi")
-    gemm1_func(
-        tvm_ffi.from_dlpack(hidden_states),
-        tvm_ffi.from_dlpack(hidden_states_scale.to(torch.float32)),
-        tvm_ffi.from_dlpack(gemm1_weights),
-        tvm_ffi.from_dlpack(gemm1_weights_scale.to(torch.float32)),
-        tvm_ffi.from_dlpack(expert_token_offsets),
-        tvm_ffi.from_dlpack(token_indices),
-        tvm_ffi.from_dlpack(local_expert_ids),
-        tvm_ffi.from_dlpack(inter_tokens),
-        seq_len, local_expert_offset
-    )
-    torch.cuda.nvtx.range_pop()
-    
-    # --- Step 5: KERNEL 6 (GEMM2) ---
-    torch.cuda.nvtx.range_push("moe_gemm2_acc")
     output = torch.zeros(seq_len, H, device=device, dtype=torch.bfloat16)
-    gemm2_func = _get_global_func_cached("kernel6_ffi")
-    gemm2_func(
-        tvm_ffi.from_dlpack(inter_tokens),
+
+    routing_logits_f32 = routing_logits if routing_logits.dtype == torch.float32 else routing_logits.to(torch.float32)
+    routing_bias_bf16 = routing_bias if routing_bias.dtype == torch.bfloat16 else routing_bias.to(torch.bfloat16)
+    hidden_states_scale_f32 = (
+        hidden_states_scale if hidden_states_scale.dtype == torch.float32 else hidden_states_scale.to(torch.float32)
+    )
+    gemm1_weights_scale_f32 = (
+        gemm1_weights_scale if gemm1_weights_scale.dtype == torch.float32 else gemm1_weights_scale.to(torch.float32)
+    )
+    gemm2_weights_scale_f32 = (
+        gemm2_weights_scale if gemm2_weights_scale.dtype == torch.float32 else gemm2_weights_scale.to(torch.float32)
+    )
+
+    torch.cuda.nvtx.range_push("integrated_moe_ffi")
+    integrated_func = _get_global_func_cached("integrated_moe_ffi")
+    integrated_func(
+        tvm_ffi.from_dlpack(routing_logits_f32),
+        tvm_ffi.from_dlpack(routing_bias_bf16),
+        tvm_ffi.from_dlpack(hidden_states),
+        tvm_ffi.from_dlpack(hidden_states_scale_f32),
+        tvm_ffi.from_dlpack(gemm1_weights),
+        tvm_ffi.from_dlpack(gemm1_weights_scale_f32),
         tvm_ffi.from_dlpack(gemm2_weights),
-        tvm_ffi.from_dlpack(gemm2_weights_scale.to(torch.float32)),
-        tvm_ffi.from_dlpack(expert_token_offsets),
-        tvm_ffi.from_dlpack(token_indices),
-        tvm_ffi.from_dlpack(local_expert_ids),
-        tvm_ffi.from_dlpack(merged_token_weights),
+        tvm_ffi.from_dlpack(gemm2_weights_scale_f32),
         tvm_ffi.from_dlpack(output),
-        seq_len, local_expert_offset, routed_scaling_factor
+        seq_len,
+        local_expert_offset,
+        routed_scaling_factor,
     )
     torch.cuda.nvtx.range_pop()
-    
+
     return output

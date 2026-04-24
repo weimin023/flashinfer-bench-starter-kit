@@ -19,6 +19,7 @@ cudaError_t launch_fallback_backend(const Kernel4Problem& p,
         total_tokens,
         p.seq_len
     );
+    CUDA_CHECK(cudaGetLastError());
     if (gemm1_only) {
         return cudaSuccess;
     }
@@ -56,17 +57,23 @@ cudaError_t launch_tiled_backend(const Kernel4Problem& p,
                                  const Kernel4Workspace& workspace,
                                  int total_tokens,
                                  bool gemm1_only) {
-    dim3 block_gemm1(BN);
-    for (int expert = 0; expert < NUM_LOCAL_EXPERTS; ++expert) {
-        int begin = 0;
-        int end = 0;
-        CUDA_CHECK(cudaMemcpy(&begin,
-            p.expert_token_offsets + expert,
-            sizeof(int), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(&end,
-            p.expert_token_offsets + expert + 1,
-            sizeof(int), cudaMemcpyDeviceToHost));
+    int local_host_offsets[NUM_LOCAL_EXPERTS + 1];
+    const int* host_offsets = p.host_expert_token_offsets;
+    if (!host_offsets) {
+        CUDA_CHECK(cudaMemcpy(
+            local_host_offsets,
+            p.expert_token_offsets,
+            sizeof(local_host_offsets),
+            cudaMemcpyDeviceToHost));
+        host_offsets = local_host_offsets;
+    }
 
+    dim3 block_gemm1(BN);
+    dim3 block_micro(K4_MICRO_BN);
+    dim3 block_small(K4_SMALL_BN);
+    for (int expert = 0; expert < NUM_LOCAL_EXPERTS; ++expert) {
+        int begin = host_offsets[expert];
+        int end = host_offsets[expert + 1];
         int token_count = end - begin;
         if (token_count <= 0) {
             continue;
@@ -82,17 +89,44 @@ cudaError_t launch_tiled_backend(const Kernel4Problem& p,
             (size_t)expert * NUM_GEMM1_OUT_BLOCKS * NUM_HIDDEN_BLOCKS;
         __nv_bfloat16* out_e = workspace.gemm1_output + (size_t)begin * INTERMEDIATE_SIZE;
 
-        dim3 grid_gemm1((token_count + BT - 1) / BT, NUM_INTER_BLOCKS);
-        fp8_gemm1_swiglu_kernel<<<grid_gemm1, block_gemm1, 0, p.stream>>>(
-            act_e,
-            p.hidden_states_scale,
-            token_indices_e,
-            token_count,
-            w_e,
-            ws_e,
-            out_e,
-            p.seq_len
-        );
+        if (token_count <= 4) {
+            dim3 grid_micro((token_count + K4_MICRO_BT - 1) / K4_MICRO_BT, NUM_INTER_BLOCKS);
+            fp8_gemm1_swiglu_micro_kernel<<<grid_micro, block_micro, 0, p.stream>>>(
+                act_e,
+                p.hidden_states_scale,
+                token_indices_e,
+                token_count,
+                w_e,
+                ws_e,
+                out_e,
+                p.seq_len
+            );
+        } else if (token_count <= 16) {
+            dim3 grid_small((token_count + K4_SMALL_BT - 1) / K4_SMALL_BT,
+                            INTERMEDIATE_SIZE / K4_SMALL_BN);
+            fp8_gemm1_swiglu_small_kernel<<<grid_small, block_small, 0, p.stream>>>(
+                act_e,
+                p.hidden_states_scale,
+                token_indices_e,
+                token_count,
+                w_e,
+                ws_e,
+                out_e,
+                p.seq_len
+            );
+        } else {
+            dim3 grid_gemm1((token_count + BT - 1) / BT, NUM_INTER_BLOCKS);
+            fp8_gemm1_swiglu_kernel<<<grid_gemm1, block_gemm1, 0, p.stream>>>(
+                act_e,
+                p.hidden_states_scale,
+                token_indices_e,
+                token_count,
+                w_e,
+                ws_e,
+                out_e,
+                p.seq_len
+            );
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 

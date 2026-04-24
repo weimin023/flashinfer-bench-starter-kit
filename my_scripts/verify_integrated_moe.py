@@ -84,6 +84,7 @@ def ensure_required_ffi_funcs(tvm_ffi_module) -> None:
         "reindex_ffi",
         "gemm1_swiglu_ffi",
         "kernel6_ffi",
+        "integrated_moe_ffi",
     ]
     missing = [
         name

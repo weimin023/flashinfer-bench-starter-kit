@@ -78,8 +78,8 @@ cudaError_t k6_launch(const Kernel6Problem& p,
         return cudaErrorInvalidValue;
     }
 
-    int total_tokens = 0;
-    {
+    int total_tokens = p.total_dispatched_tokens;
+    if (total_tokens < 0) {
         int last = 0;
         K6_CUDA_CHECK(cudaMemcpy(&last,
             p.expert_token_offsets + NUM_LOCAL_EXPERTS,
@@ -141,6 +141,11 @@ cudaError_t k6_launch(const Kernel6Problem& p,
             shared_problem, shared_workspace, total_tokens);
     }
 #endif
+
+    if (p.backend == Kernel6Backend::Tiled) {
+        return kernel6_internal::launch_tiled_gemm2_combine(
+            shared_problem, shared_workspace, total_tokens);
+    }
 
     return kernel6_internal::launch_fallback_gemm2_combine(
         shared_problem, shared_workspace, total_tokens);
