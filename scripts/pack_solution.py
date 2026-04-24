@@ -1,9 +1,4 @@
-"""
-Pack solution source files into solution.json.
-
-Reads configuration from config.toml and packs the appropriate source files
-(Triton or CUDA) into a Solution JSON file for submission.
-"""
+"""Pack solution source files into `solution.json`."""
 
 import sys
 from pathlib import Path
@@ -31,6 +26,28 @@ def load_config() -> dict:
         return tomllib.load(f)
 
 
+def resolve_source_dir(language: str, source_dir_name: str | None) -> Path:
+    """Resolve the configured source directory."""
+    if source_dir_name is None:
+        if language == "triton":
+            return PROJECT_ROOT / "solution" / "triton"
+        if language in {"cuda", "python"}:
+            return PROJECT_ROOT / "solution" / "cuda"
+        raise ValueError(f"Unsupported language: {language}")
+    return PROJECT_ROOT / "solution" / source_dir_name
+
+
+def build_spec_from_config(build_config: dict) -> BuildSpec:
+    """Build a BuildSpec from config.toml."""
+    return BuildSpec(
+        language=build_config["language"],
+        target_hardware=["cuda"],
+        entry_point=build_config["entry_point"],
+        destination_passing_style=build_config.get("destination_passing_style", True),
+        binding=build_config.get("binding"),
+    )
+
+
 def pack_solution(output_path: Path = None) -> Path:
     """Pack solution files into a Solution JSON."""
     config = load_config()
@@ -38,30 +55,12 @@ def pack_solution(output_path: Path = None) -> Path:
     solution_config = config["solution"]
     build_config = config["build"]
 
-    language = build_config["language"]
-    entry_point = build_config["entry_point"]
-
-    # Determine source directory based on language
-    if language == "triton":
-        source_dir = PROJECT_ROOT / "solution" / "triton"
-    elif language == "cuda":
-        source_dir = PROJECT_ROOT / "solution" / "cuda"
-    else:
-        raise ValueError(f"Unsupported language: {language}")
+    spec = build_spec_from_config(build_config)
+    source_dir = resolve_source_dir(spec.language, build_config.get("source_dir"))
 
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
-    # Create build spec
-    dps = build_config.get("destination_passing_style", True)
-    spec = BuildSpec(
-        language=language,
-        target_hardware=["cuda"],
-        entry_point=entry_point,
-        destination_passing_style=dps,
-    )
-
-    # Pack the solution
     solution = pack_solution_from_files(
         path=str(source_dir),
         spec=spec,
@@ -79,7 +78,7 @@ def pack_solution(output_path: Path = None) -> Path:
     print(f"  Name: {solution.name}")
     print(f"  Definition: {solution.definition}")
     print(f"  Author: {solution.author}")
-    print(f"  Language: {language}")
+    print(f"  Language: {spec.language}")
 
     return output_path
 

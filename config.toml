@@ -1,8 +1,10 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+name = "flashkernel-solution-v1"      # Solution name
+definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
+author = "FlashKernel"              # Team/author name
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "python"               # triton | cuda | python
+source_dir = "cuda"
+entry_point = "integrated_moe_kernel.py::run"
+destination_passing_style = false
