@@ -338,6 +338,111 @@ __global__ void fp8_gemm1_swiglu_small_kernel(
     }
 }
 
+__global__ void fp8_gemm1_swiglu_grouped_small_kernel(
+    const fp8_e4m3* __restrict__ act,
+    const float*    __restrict__ act_scale,
+    const int*      __restrict__ token_indices,
+    const int*      __restrict__ local_expert_ids,
+    const fp8_e4m3* __restrict__ W,
+    const float*    __restrict__ W_scale,
+    __nv_bfloat16*  __restrict__ out,
+    int             total_tokens,
+    int             seq_len)
+{
+    int tile_t = blockIdx.x * K4_GROUPED_SMALL_BT;
+    int tile_bn = blockIdx.y;
+    int tid = threadIdx.x;
+    int out_col = tile_bn * K4_GROUPED_SMALL_BN + tid;
+
+    __shared__ float A_smem[K4_GROUPED_SMALL_BT][BK];
+    __shared__ uint8_t W_up_smem[K4_GROUPED_SMALL_BT][K4_GROUPED_SMALL_BN][BK];
+    __shared__ uint8_t W_gate_smem[K4_GROUPED_SMALL_BT][K4_GROUPED_SMALL_BN][BK];
+
+    float acc_up[K4_GROUPED_SMALL_BT] = {};
+    float acc_gate[K4_GROUPED_SMALL_BT] = {};
+    int orig_tok[K4_GROUPED_SMALL_BT];
+    int expert_id[K4_GROUPED_SMALL_BT];
+
+    #pragma unroll
+    for (int t = 0; t < K4_GROUPED_SMALL_BT; ++t) {
+        int tok = tile_t + t;
+        orig_tok[t] = (tok < total_tokens) ? load_cached(token_indices + tok) : 0;
+        expert_id[t] = (tok < total_tokens) ? load_cached(local_expert_ids + tok) : 0;
+    }
+
+    for (int bk = 0; bk < NUM_HIDDEN_BLOCKS; ++bk) {
+        int k_base = bk * BK;
+
+        #pragma unroll
+        for (int t = 0; t < K4_GROUPED_SMALL_BT; ++t) {
+            int tok = tile_t + t;
+            for (int k = tid; k < BK; k += K4_GROUPED_SMALL_BN) {
+                A_smem[t][k] = (tok < total_tokens)
+                    ? fp8_to_float(act[(size_t)orig_tok[t] * HIDDEN_SIZE + k_base + k])
+                    : 0.f;
+            }
+
+            const fp8_e4m3* W_e = W + (size_t)expert_id[t] * GEMM1_OUT_SIZE * HIDDEN_SIZE;
+            if (tok < total_tokens && out_col < INTERMEDIATE_SIZE) {
+                for (int k = 0; k < BK; ++k) {
+                    W_up_smem[t][tid][k] = load_cached(
+                        W_e + (size_t)out_col * HIDDEN_SIZE + k_base + k);
+                    W_gate_smem[t][tid][k] = load_cached(
+                        W_e + (size_t)(INTERMEDIATE_SIZE + out_col) * HIDDEN_SIZE + k_base + k);
+                }
+            }
+        }
+
+        __syncthreads();
+
+        if (out_col < INTERMEDIATE_SIZE) {
+            #pragma unroll
+            for (int t = 0; t < K4_GROUPED_SMALL_BT; ++t) {
+                int tok = tile_t + t;
+                if (tok >= total_tokens) {
+                    continue;
+                }
+
+                const float* Ws_e = W_scale +
+                    (size_t)expert_id[t] * NUM_GEMM1_OUT_BLOCKS * NUM_HIDDEN_BLOCKS;
+                float a_scale = load_cached(act_scale + bk * seq_len + orig_tok[t]);
+                float ws_up = load_cached(Ws_e + tile_bn * NUM_HIDDEN_BLOCKS + bk);
+                float ws_gate = load_cached(
+                    Ws_e + (INTERMEDIATE_SIZE / K4_GROUPED_SMALL_BN + tile_bn) *
+                    NUM_HIDDEN_BLOCKS + bk);
+                float dot_up = 0.f;
+                float dot_gate = 0.f;
+                #pragma unroll
+                for (int k = 0; k < BK; ++k) {
+                    float a = A_smem[t][k];
+                    dot_up += a * fp8_to_float(W_up_smem[t][tid][k]);
+                    dot_gate += a * fp8_to_float(W_gate_smem[t][tid][k]);
+                }
+                acc_up[t] += dot_up * a_scale * ws_up;
+                acc_gate[t] += dot_gate * a_scale * ws_gate;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (out_col >= INTERMEDIATE_SIZE) {
+        return;
+    }
+
+    #pragma unroll
+    for (int t = 0; t < K4_GROUPED_SMALL_BT; ++t) {
+        int tok = tile_t + t;
+        if (tok >= total_tokens) {
+            continue;
+        }
+        float gate = acc_gate[t];
+        float silu_gate = gate * (1.f / (1.f + expf(-gate)));
+        out[(size_t)tok * INTERMEDIATE_SIZE + out_col] =
+            __float2bfloat16(acc_up[t] * silu_gate);
+    }
+}
+
 
 #if defined(K4_ENABLE_CUTLASS)
 __global__ void dequant_activations_kernel(

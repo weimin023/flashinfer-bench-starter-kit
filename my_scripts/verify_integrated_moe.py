@@ -277,6 +277,13 @@ def summarize_diff(gold: torch.Tensor, test: torch.Tensor) -> tuple[float, float
     return mse, max_abs, max_rel
 
 
+def copy_output_to_pinned_cpu(out: torch.Tensor) -> torch.Tensor:
+    out_cpu = torch.empty(out.shape, device="cpu", dtype=torch.float32, pin_memory=True)
+    out_cpu.copy_(out, non_blocking=True)
+    torch.cuda.current_stream(out.device).synchronize()
+    return out_cpu
+
+
 def get_dispatch_ffi_funcs():
     global _DISPATCH_ROUTER_FUNC, _DISPATCH_SCAN_FUNC
     import tvm_ffi
@@ -404,12 +411,12 @@ def verify_one(
     )
 
     gold_out, gold_ms = measure_cuda_ms(gold_kernel.run, *common_args)
-    gold_out_cpu = gold_out.to(device="cpu", dtype=torch.float32)
+    gold_out_cpu = copy_output_to_pinned_cpu(gold_out)
     del gold_out
     torch.cuda.empty_cache()
 
     test_out, test_ms = measure_cuda_ms(integrated_moe_fn, *common_args)
-    test_out_cpu = test_out.to(device="cpu", dtype=torch.float32)
+    test_out_cpu = copy_output_to_pinned_cpu(test_out)
     del test_out
     torch.cuda.empty_cache()
 

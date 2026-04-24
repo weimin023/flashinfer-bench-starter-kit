@@ -7,18 +7,35 @@ cudaError_t launch_fallback_backend(const Kernel4Problem& p,
                                     int total_tokens,
                                     bool gemm1_only) {
     dim3 block(256);
-    dim3 gemm1_grid(total_tokens, (INTERMEDIATE_SIZE + block.x - 1) / block.x);
-    fp8_gemm1_swiglu_reference_kernel<<<gemm1_grid, block, 0, p.stream>>>(
-        p.hidden_states,
-        p.hidden_states_scale,
-        p.token_indices,
-        p.local_expert_ids,
-        p.gemm1_weights,
-        p.gemm1_weights_scale,
-        workspace.gemm1_output,
-        total_tokens,
-        p.seq_len
-    );
+    if (total_tokens <= 14) {
+        dim3 grouped_block(K4_GROUPED_SMALL_BN);
+        dim3 grouped_grid((total_tokens + K4_GROUPED_SMALL_BT - 1) / K4_GROUPED_SMALL_BT,
+                          INTERMEDIATE_SIZE / K4_GROUPED_SMALL_BN);
+        fp8_gemm1_swiglu_grouped_small_kernel<<<grouped_grid, grouped_block, 0, p.stream>>>(
+            p.hidden_states,
+            p.hidden_states_scale,
+            p.token_indices,
+            p.local_expert_ids,
+            p.gemm1_weights,
+            p.gemm1_weights_scale,
+            workspace.gemm1_output,
+            total_tokens,
+            p.seq_len
+        );
+    } else {
+        dim3 gemm1_grid(total_tokens, (INTERMEDIATE_SIZE + block.x - 1) / block.x);
+        fp8_gemm1_swiglu_reference_kernel<<<gemm1_grid, block, 0, p.stream>>>(
+            p.hidden_states,
+            p.hidden_states_scale,
+            p.token_indices,
+            p.local_expert_ids,
+            p.gemm1_weights,
+            p.gemm1_weights_scale,
+            workspace.gemm1_output,
+            total_tokens,
+            p.seq_len
+        );
+    }
     CUDA_CHECK(cudaGetLastError());
     if (gemm1_only) {
         return cudaSuccess;

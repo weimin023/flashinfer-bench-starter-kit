@@ -151,6 +151,10 @@ Kernel4Backend choose_kernel4_backend_policy(int seq_len,
         return Kernel4Backend::Tiled;
     }
 
+    if (k4_cutlass_available() && total_tok >= 18 && total_tok <= 24) {
+        return Kernel4Backend::Cutlass;
+    }
+
     // Small: minimize setup overhead.
     if (total_tok <= 256 || seq_len <= 32) {
         return has_local_expert_ids ? Kernel4Backend::Fallback : Kernel4Backend::Tiled;
@@ -505,17 +509,23 @@ void integrated_moe_ffi_wrapper(ffi::Tensor routing_logits,
     finalize_expert_offsets(local_counts_ptr, buffers.expert_token_offsets, moe_spec::NUM_LOCAL_EXPERTS);
 
     int total_tok = 0;
-    cudaMemcpy(
-        &total_tok,
-        buffers.expert_token_offsets + moe_spec::NUM_LOCAL_EXPERTS,
-        sizeof(int),
-        cudaMemcpyDeviceToHost);
     int host_expert_offsets[moe_spec::NUM_LOCAL_EXPERTS + 1];
-    cudaMemcpy(
-        host_expert_offsets,
-        buffers.expert_token_offsets,
-        sizeof(host_expert_offsets),
-        cudaMemcpyDeviceToHost);
+    const int* host_expert_offsets_ptr = nullptr;
+    if (k4_cutlass_available() && seq_len >= 1024) {
+        cudaMemcpy(
+            &total_tok,
+            buffers.expert_token_offsets + moe_spec::NUM_LOCAL_EXPERTS,
+            sizeof(int),
+            cudaMemcpyDeviceToHost);
+    } else {
+        cudaMemcpy(
+            host_expert_offsets,
+            buffers.expert_token_offsets,
+            sizeof(host_expert_offsets),
+            cudaMemcpyDeviceToHost);
+        total_tok = host_expert_offsets[moe_spec::NUM_LOCAL_EXPERTS];
+        host_expert_offsets_ptr = host_expert_offsets;
+    }
 
     launch_moe_reindex(
         buffers.token_expert_indices,
@@ -545,7 +555,7 @@ void integrated_moe_ffi_wrapper(ffi::Tensor routing_logits,
     k4_problem.gemm1_weights_scale = static_cast<const float*>(gemm1_weights_scale.data_ptr());
     k4_problem.local_expert_offset = local_expert_offset;
     k4_problem.expert_token_offsets = buffers.expert_token_offsets;
-    k4_problem.host_expert_token_offsets = host_expert_offsets;
+    k4_problem.host_expert_token_offsets = host_expert_offsets_ptr;
     k4_problem.total_dispatched_tokens = total_tok;
     k4_problem.token_indices = buffers.token_indices;
     k4_problem.local_expert_ids = buffers.local_expert_ids;
