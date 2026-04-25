@@ -11,6 +11,7 @@ _SCAN_FUNC = None
 _REINDEX_FUNC = None
 _GEMM1_FUNC = None
 _GEMM2_FUNC = None
+_INTEGRATED_MOE_FUNC = None
 _FFI_LOADED = False
 
 
@@ -21,6 +22,22 @@ def _find_tvm_ffi_root() -> Path:
     if not include_dir.exists() or not lib_dir.exists():
         raise RuntimeError(f"Invalid tvm_ffi installation: {root}")
     return root
+
+
+def _find_cutlass_dir(source_dir: Path) -> Path | None:
+    candidates = []
+    if os.environ.get("CUTLASS_DIR"):
+        candidates.append(Path(os.environ["CUTLASS_DIR"]))
+    candidates.extend([
+        Path("/workspace/cutlass"),
+        source_dir.parent.parent / "cutlass",
+        Path.home() / ".local" / "src" / "cutlass",
+        Path("/root/cutlass"),
+    ])
+    for candidate in candidates:
+        if (candidate / "include" / "cutlass" / "cutlass.h").exists():
+            return candidate
+    return None
 
 
 def _build_ffi_library(source_dir: Path, library_path: Path) -> None:
@@ -36,6 +53,16 @@ def _build_ffi_library(source_dir: Path, library_path: Path) -> None:
         if entry:
             gencode_flags.extend(["-gencode", entry])
 
+    extra_flags = []
+    cutlass_dir = _find_cutlass_dir(source_dir)
+    if cutlass_dir is not None:
+        extra_flags.extend([
+            "-I",
+            str(cutlass_dir / "include"),
+            "-DK4_ENABLE_CUTLASS=1",
+            "--expt-relaxed-constexpr",
+        ])
+
     command = [
         nvcc,
         "-shared",
@@ -49,6 +76,7 @@ def _build_ffi_library(source_dir: Path, library_path: Path) -> None:
         "-ltvm_ffi",
         "-I",
         str(source_dir / "moe_expert_mlp"),
+        *extra_flags,
         "-o",
         str(library_path),
         str(source_dir / "moe_ffi.cu"),
@@ -63,7 +91,11 @@ def _ensure_ffi_loaded() -> None:
 
     source_dir = Path(__file__).resolve().parent
     library_path = source_dir / "librouter_ffi.so"
-    if not library_path.exists():
+    source_path = source_dir / "moe_ffi.cu"
+    should_rebuild = not library_path.exists()
+    if not should_rebuild and source_path.exists():
+        should_rebuild = library_path.stat().st_mtime < source_path.stat().st_mtime
+    if should_rebuild:
         _build_ffi_library(source_dir, library_path)
 
     tvm_ffi.load_module(str(library_path))
@@ -72,12 +104,14 @@ def _ensure_ffi_loaded() -> None:
 
 def _get_global_func_cached(name: str):
     global _ROUTER_FUNC, _SCAN_FUNC, _REINDEX_FUNC, _GEMM1_FUNC, _GEMM2_FUNC
+    global _INTEGRATED_MOE_FUNC
     cache = {
         "router_ffi": "_ROUTER_FUNC",
         "scan_ffi": "_SCAN_FUNC",
         "reindex_ffi": "_REINDEX_FUNC",
         "gemm1_swiglu_ffi": "_GEMM1_FUNC",
         "kernel6_ffi": "_GEMM2_FUNC",
+        "integrated_moe_ffi": "_INTEGRATED_MOE_FUNC",
     }
     cache_name = cache[name]
     func = globals()[cache_name]
@@ -249,85 +283,26 @@ def integrated_moe(
     device = routing_logits.device
     seq_len = routing_logits.shape[0]
     H = hidden_states.shape[1]
-    
-    # --- Step 1: ROUTING ---
-    torch.cuda.nvtx.range_push("moe_routing")
-    expert_token_counts = torch.zeros(E_GLOBAL, device=device, dtype=torch.int32)
-    token_expert_indices = torch.zeros(seq_len, TOP_K, device=device, dtype=torch.int32)
-    token_expert_weights = torch.zeros(seq_len, TOP_K, device=device, dtype=torch.float32)
-    token_expert_slots = torch.zeros(seq_len, TOP_K, device=device, dtype=torch.int32)
-    
-    router_func = _get_global_func_cached("router_ffi")
-    router_func(
+    output = torch.zeros(seq_len, H, device=device, dtype=torch.bfloat16)
+
+    torch.cuda.nvtx.range_push("integrated_moe_ffi")
+    integrated_moe_func = _get_global_func_cached("integrated_moe_ffi")
+    integrated_moe_func(
         tvm_ffi.from_dlpack(routing_logits.to(torch.float32)),
         tvm_ffi.from_dlpack(routing_bias.to(torch.bfloat16)),
-        tvm_ffi.from_dlpack(expert_token_counts),
-        tvm_ffi.from_dlpack(token_expert_indices),
-        tvm_ffi.from_dlpack(token_expert_weights),
-        tvm_ffi.from_dlpack(token_expert_slots),
-        seq_len, local_expert_offset, routed_scaling_factor
-    )
-    torch.cuda.nvtx.range_pop()
-    
-    # --- Step 2: SCAN ---
-    torch.cuda.nvtx.range_push("moe_scan")
-    expert_token_offsets = torch.zeros(E_LOCAL + 1, device=device, dtype=torch.int32)
-    local_counts = expert_token_counts[local_expert_offset : local_expert_offset + E_LOCAL]
-    
-    scan_func = _get_global_func_cached("scan_ffi")
-    scan_func(
-        tvm_ffi.from_dlpack(local_counts),
-        tvm_ffi.from_dlpack(expert_token_offsets),
-        E_LOCAL + 1
-    )
-    torch.cuda.nvtx.range_pop()
-
-    # --- Step 3: PREPARE INDICES ---
-    torch.cuda.nvtx.range_push("moe_reindex")
-    token_indices, local_expert_ids, merged_token_weights = reindex_and_gather_gpu(
-        token_expert_indices, token_expert_weights, token_expert_slots,
-        expert_token_offsets, seq_len, TOP_K, local_expert_offset
-    )
-    torch.cuda.nvtx.range_pop()
-
-    # --- Step 4: KERNEL 4 (GEMM1 + SwiGLU) ---
-    torch.cuda.nvtx.range_push("moe_gemm1_swiglu")
-    # I = intermediate_size. gemm2_weights shape is [E_LOCAL, H, I]
-    I = gemm2_weights.shape[2]
-    total_assigned = int(expert_token_offsets[-1].item())
-    inter_tokens = torch.empty(total_assigned, I, device=device, dtype=torch.bfloat16)
-    
-    gemm1_func = _get_global_func_cached("gemm1_swiglu_ffi")
-    gemm1_func(
         tvm_ffi.from_dlpack(hidden_states),
         tvm_ffi.from_dlpack(hidden_states_scale.to(torch.float32)),
         tvm_ffi.from_dlpack(gemm1_weights),
         tvm_ffi.from_dlpack(gemm1_weights_scale.to(torch.float32)),
-        tvm_ffi.from_dlpack(expert_token_offsets),
-        tvm_ffi.from_dlpack(token_indices),
-        tvm_ffi.from_dlpack(local_expert_ids),
-        tvm_ffi.from_dlpack(inter_tokens),
-        seq_len, local_expert_offset
-    )
-    torch.cuda.nvtx.range_pop()
-    
-    # --- Step 5: KERNEL 6 (GEMM2) ---
-    torch.cuda.nvtx.range_push("moe_gemm2_acc")
-    output = torch.zeros(seq_len, H, device=device, dtype=torch.bfloat16)
-    gemm2_func = _get_global_func_cached("kernel6_ffi")
-    gemm2_func(
-        tvm_ffi.from_dlpack(inter_tokens),
         tvm_ffi.from_dlpack(gemm2_weights),
         tvm_ffi.from_dlpack(gemm2_weights_scale.to(torch.float32)),
-        tvm_ffi.from_dlpack(expert_token_offsets),
-        tvm_ffi.from_dlpack(token_indices),
-        tvm_ffi.from_dlpack(local_expert_ids),
-        tvm_ffi.from_dlpack(merged_token_weights),
         tvm_ffi.from_dlpack(output),
-        seq_len, local_expert_offset, routed_scaling_factor
+        seq_len,
+        local_expert_offset,
+        routed_scaling_factor,
     )
     torch.cuda.nvtx.range_pop()
-    
+
     return output
 
 
