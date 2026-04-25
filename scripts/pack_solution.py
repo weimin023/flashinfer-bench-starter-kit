@@ -12,8 +12,10 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from flashinfer_bench import BuildSpec
-from flashinfer_bench.agents import pack_solution_from_files
+from flashinfer_bench import BuildSpec, Solution, SourceFile
+
+
+VALID_SOURCE_EXTENSIONS = {".py", ".cu", ".cuh", ".cpp", ".c", ".h", ".hpp"}
 
 
 def load_config() -> dict:
@@ -61,12 +63,26 @@ def pack_solution(output_path: Path = None) -> Path:
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
-    solution = pack_solution_from_files(
-        path=str(source_dir),
-        spec=spec,
+    sources = []
+    for file_path in sorted(source_dir.rglob("*")):
+        if not file_path.is_file():
+            continue
+        if any(part.startswith(".") for part in file_path.relative_to(source_dir).parts):
+            continue
+        if file_path.suffix.lower() not in VALID_SOURCE_EXTENSIONS:
+            continue
+        rel_path = file_path.relative_to(source_dir).as_posix()
+        sources.append(SourceFile(path=rel_path, content=file_path.read_text(encoding="utf-8")))
+
+    if not sources:
+        raise ValueError(f"No source files found in directory: {source_dir}")
+
+    solution = Solution(
         name=solution_config["name"],
         definition=solution_config["definition"],
         author=solution_config["author"],
+        spec=spec,
+        sources=sources,
     )
 
     # Write to output file
